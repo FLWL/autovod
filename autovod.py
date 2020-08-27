@@ -7,6 +7,7 @@ import datetime
 import subprocess
 import time
 import os
+import re
 from proglog import TqdmProgressBarLogger
 
 
@@ -43,6 +44,8 @@ binary_path = "bin/"
 concat_binary_name = "concat_win.exe" if os.name == 'nt' else "concat_linux"
 youtubeuploader_binary_name = "youtubeuploader_windows_amd64.exe" if os.name == 'nt' else "youtubeuploader_linux_amd64"
 twitch_client_id = "***" # the key to access Twitch API
+twitch_download_client_id = "***" # client ids from registered applications can't be used to download VODs
+# need to use a regular user's client id here instead (this can be extracted from watching https requests in the browser for example)
 num_threads = 6 # number of CPU threads to use when encoding the final clip
 
 
@@ -73,7 +76,7 @@ def find_sound_event(my_clip, last_event_time, current_time):
 def download_vod(video_id):
     wd = os.getcwd()
     os.chdir(binary_path)
-    subprocess.call([concat_binary_name, "-vod", video_id])
+    subprocess.call([concat_binary_name, "-vod", video_id, "--client-id", twitch_download_client_id])
     os.chdir(wd)
 
 
@@ -82,6 +85,17 @@ def upload_video(video_path, metadata_path):
     os.chdir(binary_path)
     subprocess.call([youtubeuploader_binary_name, '-headlessAuth', '-filename', '../' + video_path, '-metaJSON', '../' + metadata_path])
     os.chdir(wd)
+
+
+def parse_video_length(video_length_text):
+    numbers_in_text = re.findall("\d+", video_length_text)
+    numbers_in_text.reverse()
+    time_multipliers = [1, 60, 3600, 86400]
+    total_seconds = 0
+    for i, number in enumerate(numbers_in_text):
+        total_seconds += time_multipliers[i] * int(number)
+
+    return total_seconds
 
 
 print("Starting script. Time is: " + str(datetime.datetime.now()))
@@ -93,20 +107,31 @@ with open("resources/processed_broadcasts.txt", "r+") as f:
 
 processed_broadcasts = [x.strip() for x in processed_broadcasts] # remove whitespace characters like `\n` at the end of each line
 
+# convert the Twitch channel name to user ID
+print("User ID for channel \"" + twitch_channel_name + "\" = ", end="")
+twitch_api_link = "https://api.twitch.tv/helix/users?login=" + twitch_channel_name
+twitch_response_text = requests.get(twitch_api_link, headers={"Client-ID": twitch_client_id}).text
+twitch_response = json.loads(twitch_response_text)
+twitch_user_id = twitch_response["data"][0]["id"]
+print(twitch_user_id)
+print("Twitch response (max 128 chars): " + twitch_response_text[:128] + (" ..." if len(twitch_response_text) > 128 else ""))
+
 # get latest broadcasts from twitch
 print("Fetching latest broadcasts from Twitch...")
-twitch_api_link = "https://api.twitch.tv/kraken/channels/" + twitch_channel_name + "/videos?client_id=" + twitch_client_id + "&broadcast_type=archive"
-twitch_response_text = requests.get(twitch_api_link).text
+twitch_api_link = "https://api.twitch.tv/helix/videos?user_id=" + twitch_user_id + "&type=archive"
+twitch_response_text = requests.get(twitch_api_link, headers={"Client-ID": twitch_client_id}).text
 twitch_response = json.loads(twitch_response_text)
 print("Twitch response (max 128 chars): " + twitch_response_text[:128] + (" ..." if len(twitch_response_text) > 128 else ""))
 
 # find oldest unprocessed broadcast and the others that were published on the same day
-oldest_video_title = ""
+longest_video_title = ""
+longest_video_seconds = 0
 oldest_video_date = ""
 videos_to_process = []
-for video in reversed(twitch_response["videos"]):
-    video_id = video["_id"][1:]
-    video_length = video["length"]
+for video in reversed(twitch_response["data"]):
+    video_id = video["id"]
+    video_length_text = video["duration"]
+    video_length_in_seconds = parse_video_length(video_length_text)
 
     if video_id in processed_broadcasts:
         continue
@@ -115,12 +140,16 @@ for video in reversed(twitch_response["videos"]):
 
     if not oldest_video_date:
         oldest_video_date = date
-        oldest_video_title = video["title"]
     elif date.date() != oldest_video_date.date():
         continue # skip this broadcast if its not on the same date as the oldest unprocessed one we found
 
+    if video_length_in_seconds > longest_video_seconds:
+        longest_video_title = video["title"]
+        longest_video_seconds = video_length_in_seconds
+
     videos_to_process.append(video_id)
-    print("Added video " + video_id + " of length " + str(video_length) + " from " + str(date.date()) + " to list: " + video["title"])
+    print("Added video " + video_id + " of length " + video_length_text + " (" + str(video_length_in_seconds)
+          + " s) from " + str(date.date()) + " to list: " + video["title"])
 
 if len(videos_to_process) == 0:
     sys.exit("Exiting: no videos to process at this time.")
@@ -150,8 +179,8 @@ else:
     print("Final metadata has not been created yet.")
 
 # start putting together the video description
-title = twitch_channel_name + " Highlights " + formatted_date + ": " + oldest_video_title
-description = "Live stream highlights from " + twitch_channel_name + " on " + formatted_date + ": " + oldest_video_title + "\n\n"
+title = twitch_channel_name + " Highlights " + formatted_date + ": " + longest_video_title
+description = "Live stream highlights from " + twitch_channel_name + " on " + formatted_date + ": " + longest_video_title + "\n\n"
 tags = ["highlights", "twitch"]
 
 # create final clip if it does not exist
